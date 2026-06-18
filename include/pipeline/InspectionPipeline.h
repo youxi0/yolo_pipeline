@@ -1,0 +1,124 @@
+#pragma once
+
+#include "acquisition/ImageSource.h"
+#include "common/BlockingQueue.h"
+#include "common/DetectionResult.h"
+#include "common/FrameData.h"
+#include "infer/TensorRTInfer.h"
+#include "network/TcpServer.h"
+#include "postprocess/YoloSegPostprocessor.h"
+#include "preprocess/Preprocessor.h"
+#include "visualize/Visualizer.h"
+#include "common/FrameData.h"
+#include "preprocess/CudaPreprocessor.h"
+#include "utils/BaselineSaver.h"
+
+#include <atomic>
+#include <memory>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace blade::pipeline {
+//模块:流水线配置
+struct PipelineConfig {
+    std::string enginePath;
+    std::vector<std::string> classNames;
+    uint16_t listenPort = 9000;
+    int inputWidth = 640;
+    int inputHeight = 640;
+
+    float confThreshold = 0.25f;
+    float nmsThreshold = 0.45f;
+    float maskThreshold = 0.5f;
+
+    int jpegQuality = 85;
+    int queueSize = 4;
+
+    int heartbeatIntervalMs = 2000;
+    int heartbeatTimeoutMs = 8000;
+
+    bool useCudaPreprocess = true;
+
+    // 新增配置: FP16 baseline和运行日志的保存目录，便于后续和INT8结果做对比。
+    std::string baselineDir = "results/baseline_fp16";
+    std::string logDir = "results/logs";
+};
+
+//模块:端侧检测服务主类
+
+class InspectionPipeline {
+public:
+    InspectionPipeline(std::unique_ptr<ImageSource> source, const PipelineConfig& config);
+    ~InspectionPipeline();
+
+    bool start();
+    void stop();
+
+private:
+    void networkAcceptLoop();
+    void networkRecvLoop();
+    void heartbeatLoop(); 
+
+    void gpuInferLoop();
+
+    void captureLoop();
+    void preprocessLoop();
+    void inferLoop();
+    void postprocessLoop();
+    
+    void sendLoop();
+
+    bool sendFrame(const FrameData& frame);
+    std::string buildMetaJson(const FrameData& frame) const;
+    std::string escapeJson(const std::string& text) const;
+
+    bool compareCpuCudaPreprocess(
+    const cv::Mat& image,
+    Preprocessor& cpuPreprocessor,
+    CudaPreprocessor& cudaPreprocessor,
+    TensorRTInfer& infer
+    );
+
+
+private:
+    std::unique_ptr<ImageSource> source_;
+    PipelineConfig config_;
+
+    blade::net::TcpServer Tcpserver_;
+    BlockingQueue<FrameData> sendQueue_;
+
+    BlockingQueue<FrameData> rawQueue_;
+    BlockingQueue<FrameData> preprocessQueue_;
+    BlockingQueue<FrameData> inferQueue_;
+
+
+    std::atomic<bool> running_{false};
+    std::atomic<bool> paused_{false};
+    std::atomic<bool> processingEnabled_{true};
+    
+    
+    std::atomic<uint64_t> packetSequence_{1};
+    std::atomic<uint64_t> lastPongMs_{0};  
+
+    //线程划分:
+    //1.networkAcceptLoop:等待Qt客户端连接
+    //2.networkRecvLoop:接收Qt命令和心跳响应
+    std::thread acceptThread_;
+    std::thread recvThread_;
+    //3.heartbeatLoop:定时发心跳包,超时断开客户端
+    std::thread heartbeatThread_;
+
+    std::thread captureThread_;
+
+    std::thread gpuInferThread_;
+    std::thread preprocessThread_;
+    std::thread inferThread_;
+
+    std::thread postprocessThread_;
+
+    //5.sendLoop:把可视化图像和检测信息通过TCP发送给Qt
+    std::thread sendThread_;
+};
+
+} // namespace blade::pipeline

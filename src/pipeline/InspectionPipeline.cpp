@@ -1,0 +1,767 @@
+#include "pipeline/InspectionPipeline.h"
+#include "common/ScopeTimer.h"
+#include "utils/FileLogger.h"
+
+#include <cuda_fp16.h>
+
+#include <chrono>
+#include <iomanip>
+#include <iostream>
+#include <opencv2/imgcodecs.hpp>
+#include <sstream>
+
+#define DEBUG_PREPROCESS_COMPARE 0
+
+namespace blade::pipeline {
+
+InspectionPipeline::InspectionPipeline(std::unique_ptr<ImageSource> source, const PipelineConfig& config)
+    : source_(std::move(source)),
+      config_(config),
+      Tcpserver_(config.listenPort),
+      rawQueue_(static_cast<size_t>(config.queueSize)),
+      preprocessQueue_(static_cast<size_t>(config.queueSize)),
+      inferQueue_(static_cast<size_t>(config.queueSize)),
+      sendQueue_(static_cast<size_t>(config.queueSize)) {}
+
+InspectionPipeline::~InspectionPipeline() {
+    stop();
+}
+
+bool InspectionPipeline::start() {
+    if (running_) {
+        return true;
+    }
+
+    // 新增模块: pipeline启动时打开日志文件，后续各线程共享同一个线程安全logger。
+    auto& logger = utils::FileLogger::instance();
+    if (!logger.isOpen()) {
+        logger.open(config_.logDir);
+    }
+    logger.info("inspection pipeline starting");
+    logger.info("engine path: " + config_.enginePath);
+
+    if (!source_) {
+        std::cerr << "Image source is null." << std::endl;
+        logger.error("image source is null");
+        return false;
+    }
+
+    if (!source_->open()) {
+        std::cerr << "Failed to open image source." << std::endl;
+        logger.error("failed to open image source");
+        return false;
+    }
+
+    if (!Tcpserver_.startListen()) {
+        logger.error("failed to start tcp server");
+        source_->release();
+        return false;
+    }
+
+    running_ = true;
+    lastPongMs_ = blade::net::nowMs();
+
+    // 通信线程们
+    acceptThread_ = std::thread(&InspectionPipeline::networkAcceptLoop, this);
+    recvThread_ = std::thread(&InspectionPipeline::networkRecvLoop, this);
+    heartbeatThread_ = std::thread(&InspectionPipeline::heartbeatLoop, this);
+
+    // 处理线程们
+    captureThread_ = std::thread(&InspectionPipeline::captureLoop, this);
+    
+    if (config_.useCudaPreprocess) {
+        gpuInferThread_ = std::thread(&InspectionPipeline::gpuInferLoop, this);
+    } else {
+        preprocessThread_ = std::thread(&InspectionPipeline::preprocessLoop, this);
+        inferThread_ = std::thread(&InspectionPipeline::inferLoop, this);
+    }
+
+    postprocessThread_ = std::thread(&InspectionPipeline::postprocessLoop, this);
+    sendThread_ = std::thread(&InspectionPipeline::sendLoop, this);
+
+    logger.info("inspection pipeline started");
+    return true;
+}
+
+void InspectionPipeline::stop() {
+    if (!running_) {
+        return;
+    }
+
+    running_ = false;
+
+    paused_ = true;
+    processingEnabled_ = false;
+    
+    rawQueue_.stop();
+    preprocessQueue_.stop();
+    inferQueue_.stop();
+    sendQueue_.stop();
+
+    Tcpserver_.stop();
+
+    if (source_) {
+        source_->release();
+    }
+    // 通信线程们
+    if (acceptThread_.joinable()) {
+        acceptThread_.join();
+    }
+    if (recvThread_.joinable()) {
+        recvThread_.join();
+    }
+    if (heartbeatThread_.joinable()) {
+        heartbeatThread_.join();
+    }
+    // 处理线程们 
+    if (gpuInferThread_.joinable()) {
+        gpuInferThread_.join();
+    }
+    if (sendThread_.joinable()) {
+        sendThread_.join();
+    }
+    if (captureThread_.joinable()) {
+        captureThread_.join();
+    }
+    if (preprocessThread_.joinable()){
+        preprocessThread_.join();
+    }
+    if (inferThread_.joinable()){
+        inferThread_.join();
+    } 
+    if (postprocessThread_.joinable()) {
+        postprocessThread_.join();
+    }
+
+    utils::FileLogger::instance().info("inspection pipeline stopped");
+    utils::FileLogger::instance().close();
+}
+
+void InspectionPipeline::networkAcceptLoop() {
+    while (running_) {
+        if (Tcpserver_.isClientConnected()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            continue;
+        }
+
+        if (Tcpserver_.waitForClient()) {
+            lastPongMs_ = blade::net::nowMs();
+        }
+    }
+}
+
+void InspectionPipeline::networkRecvLoop() {
+    while (running_) {
+        if (!Tcpserver_.isClientConnected()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+
+        blade::net::Packet packet;
+        if (!Tcpserver_.receivePacket(packet)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+
+        auto type = static_cast<blade::net::PacketType>(packet.header.type);
+
+        if (type == blade::net::PacketType::HEARTBEAT_PONG) {
+            lastPongMs_ = blade::net::nowMs();
+        }
+        else if (type == blade::net::PacketType::HEARTBEAT_PING) {
+            auto pong = blade::net::makePacket(
+                blade::net::PacketType::HEARTBEAT_PONG,
+                packetSequence_++,
+                {}
+            );
+            Tcpserver_.sendPacket(pong);
+        }
+        else if (type == blade::net::PacketType::COMMAND) {
+            std::string cmd(packet.payload.begin(), packet.payload.end());
+            std::cout << "Receive command from Qt: " << cmd << std::endl;
+
+            if (cmd == "pause") {
+                paused_ = true;
+                processingEnabled_ = false;
+            }
+            else if (cmd == "resume" || cmd == "start") {
+                paused_ = false;
+                processingEnabled_ = true;
+            }
+            else if (cmd == "quit" || cmd == "stop") {
+                running_ = false;
+                sendQueue_.stop();
+                Tcpserver_.stop();
+            }
+        }
+    }
+}
+
+void InspectionPipeline::heartbeatLoop() {
+    while (running_) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(config_.heartbeatIntervalMs));
+
+        if (!running_ || !Tcpserver_.isClientConnected()) {
+            continue;
+        }
+
+        auto ping = blade::net::makePacket(
+            blade::net::PacketType::HEARTBEAT_PING,
+            packetSequence_++,
+            {}
+        );
+        Tcpserver_.sendPacket(ping);
+
+        uint64_t now = blade::net::nowMs();
+        if (now > lastPongMs_ && now - lastPongMs_ > static_cast<uint64_t>(config_.heartbeatTimeoutMs)) {
+            std::cerr << "Heartbeat timeout, close Qt client." << std::endl;
+            Tcpserver_.closeClient();
+        }
+    }
+}
+
+void InspectionPipeline::gpuInferLoop() {
+    auto& logger = utils::FileLogger::instance();
+    TensorRTInfer infer(config_.enginePath);
+
+    if (!infer.load()) {
+        std::cerr << "[GPU] failed to load TensorRT engine" << std::endl;
+        logger.error("[GPU] failed to load TensorRT engine");
+        running_ = false;
+
+        rawQueue_.stop();
+        inferQueue_.stop();
+        sendQueue_.stop();
+
+        Tcpserver_.stop();
+        return;
+    }
+    
+    logger.info("[GPU] TensorRT engine loaded");
+    CudaPreprocessor cudaPreprocessor(config_.inputWidth, config_.inputHeight);
+
+    while (running_) {
+        FrameData task;
+
+        if (!rawQueue_.pop(task)) {
+            break;
+        }
+        ///////////////////////// test
+        #if DEBUG_PREPROCESS_COMPARE 
+            if(task.frameId <= 10){
+                Preprocessor cpuPreprocessor(640, 640);
+                compareCpuCudaPreprocess(
+                task.originalImage,
+                cpuPreprocessor,
+                cudaPreprocessor,
+                infer
+            );
+            }
+        #endif
+        ///////////////////////// test
+        PreprocessResult prep;
+        ScopeTimer timer; 
+        bool ok = cudaPreprocessor.process(
+            task.originalImage,
+            infer.inputDeviceBuffer(),
+            infer.inputElementSize(),
+            prep,
+            infer.stream()
+        );
+        task.cost.preprocess_ms = timer.elapsedMs();
+        task.cost.total_ms += task.cost.preprocess_ms;
+
+        if (!ok) {
+            std::cerr << "[GPU] cuda preprocess failed, frameId="<< task.frameId<< std::endl;
+            logger.error("[GPU] cuda preprocess failed, frameId=" + std::to_string(task.frameId));
+            continue;
+        }
+
+        timer.reset();
+        auto outputs = infer.forwardFromDevice();
+        task.cost.infer_ms = timer.elapsedMs();
+        task.cost.total_ms += task.cost.infer_ms;
+
+        if (outputs.empty()) {
+            std::cerr << "[GPU] TensorRT output empty, frameId="
+                      << task.frameId
+                      << std::endl;
+            logger.error("[GPU] TensorRT output empty, frameId=" + std::to_string(task.frameId));
+            continue;
+        }
+        
+        task.prep = std::move(prep);
+        task.outputs = std::move(outputs);     
+        
+        if (!inferQueue_.push(std::move(task))) {
+            break;
+        }
+
+    }
+
+    std::cout << "[GPU] gpuInferLoop exit" << std::endl;
+    logger.info("[GPU] gpuInferLoop exit");
+}
+
+void InspectionPipeline::captureLoop() {
+    auto& logger = utils::FileLogger::instance();
+
+    while (running_) {
+        
+        if (paused_.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
+        if (!processingEnabled_.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
+
+        FrameData raw;
+        if (!source_->read(raw)) {
+            std::cerr << "[CAPTURE] source finished or read failed" << std::endl;
+            logger.warning("[CAPTURE] source finished or read failed");
+
+            // processingEnabled_.store(false);
+            running_ = false;
+
+            if(source_) source_->reset();
+            
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
+        if (!rawQueue_.push(std::move(raw))) {
+            break;
+        }
+
+
+    }
+
+    std::cout << "[CAPTURE] exit" << std::endl;
+    logger.info("[CAPTURE] exit");
+}
+
+void InspectionPipeline::preprocessLoop() {
+    auto& logger = utils::FileLogger::instance();
+    Preprocessor preprocessor(config_.inputWidth, config_.inputHeight);
+    while (running_) {
+        FrameData task;
+
+        if (!rawQueue_.pop(task)) {
+            break;
+        }     
+        // 前处理 
+        ScopeTimer timer;
+        task.prep = preprocessor.process(task.originalImage);
+        task.cost.preprocess_ms = timer.elapsedMs();
+        task.cost.total_ms += task.cost.preprocess_ms;   
+
+        if (task.prep.blob.empty()) {
+            continue;
+        }
+        if (!preprocessQueue_.push(std::move(task))) {
+            break;
+        }
+
+    }
+
+    std::cout << "[PREPROCESS] exit" << std::endl;
+    logger.info("[PREPROCESS] exit");
+}
+
+void InspectionPipeline::inferLoop() {
+    auto& logger = utils::FileLogger::instance();
+    TensorRTInfer infer(config_.enginePath);
+    if (!infer.load()) {
+        std::cerr << "Failed to load TensorRT engine." << std::endl;
+        logger.error("failed to load TensorRT engine");
+        running_ = false;
+        sendQueue_.stop();
+        Tcpserver_.stop();
+        return;
+    }
+    while (running_) {
+        FrameData inferTask;
+
+        if (!preprocessQueue_.pop(inferTask)) {
+            break;
+        }                 
+        //推理
+        ScopeTimer timer;
+        inferTask.outputs = infer.forward(inferTask.prep.blob);
+        inferTask.cost.infer_ms = timer.elapsedMs();
+        inferTask.cost.total_ms += inferTask.cost.infer_ms;
+
+        if (inferTask.outputs.empty()) {
+            logger.error("[INFER] TensorRT output empty, frameId=" + std::to_string(inferTask.frameId));
+            continue;
+        }
+        if (!inferQueue_.push(std::move(inferTask))) {
+            break;
+        }
+
+    }
+
+    std::cout << "[INFER] exit" << std::endl;
+    logger.info("[INFER] exit");
+}
+
+void InspectionPipeline::postprocessLoop() {
+    auto& logger = utils::FileLogger::instance();
+    YoloSegPostprocessor postprocessor(config_.confThreshold, config_.nmsThreshold, config_.maskThreshold);
+    Visualizer visualizer;
+    utils::BaselineSaver baselineSaver(config_.baselineDir);
+    while (running_) {
+        FrameData processed;
+
+        if (!inferQueue_.pop(processed)) {
+            break;
+        }        
+        //后处理
+        ScopeTimer timer;
+        processed.results = postprocessor.process(processed.outputs, processed.prep, config_.classNames);
+        processed.cost.postprocess_ms = timer.elapsedMs();
+        processed.cost.total_ms += processed.cost.postprocess_ms;
+
+        timer.reset();
+        processed.visualizedImage = visualizer.draw(processed.originalImage, processed.results);
+        processed.cost.visualize_ms = timer.elapsedMs();
+        processed.cost.total_ms += processed.cost.visualize_ms;
+
+        if (!baselineSaver.save(processed)) {
+            logger.warning("[BASELINE] failed to save frameId=" + std::to_string(processed.frameId));
+        }
+
+        std::ostringstream costLog;
+        costLog << "[TIME] frameId=" << processed.frameId
+                << ", preprocess=" << processed.cost.preprocess_ms << " ms"
+                << ", infer=" << processed.cost.infer_ms << " ms"
+                << ", postprocess=" << processed.cost.postprocess_ms << " ms"
+                << ", visualize=" << processed.cost.visualize_ms << " ms"
+                << ", total=" << processed.cost.total_ms << " ms"
+                << ", detections=" << processed.results.size();
+        logger.info(costLog.str());
+
+        // std::cout << "[TIME] " << "ID" << ": " << processed.frameId << std::endl
+        //           << "[TIME] "<< "preprocess" << ": " << processed.cost.preprocess_ms << " ms" << std::endl
+        //           << "[TIME] "<< "infer" << ": " << processed.cost.infer_ms << " ms" << std::endl
+        //           << "[TIME] "<< "postprocess" << ": " << processed.cost.postprocess_ms<< " ms" << std::endl
+        //           << "[TIME] "<< "visualize" << ": " << processed.cost.visualize_ms << " ms" << std::endl
+        //           << "[TIME] "<< "total" << ": " << processed.cost.total_ms << " ms" << std::endl;
+        // if(processed.frameId == 10) running_ = false;
+
+        if (!sendQueue_.push(std::move(processed))) {
+            break;
+        }
+
+    }
+
+    std::cout << "[POSTPROCESS] exit" << std::endl;
+    logger.info("[POSTPROCESS] exit");
+}
+
+void InspectionPipeline::sendLoop() {
+    while (running_) {
+        FrameData frame;
+        if (!sendQueue_.pop(frame)) {
+            break;
+        }
+
+        if (!Tcpserver_.isClientConnected()) {
+            continue;
+        }
+
+        sendFrame(frame);
+    }
+}
+
+bool InspectionPipeline::sendFrame(const FrameData& frame) {
+    std::vector<uint8_t> jpg;
+    std::vector<int> params = {
+        cv::IMWRITE_JPEG_QUALITY,
+        config_.jpegQuality
+    };
+
+    if (!cv::imencode(".jpg", frame.visualizedImage, jpg, params)) {
+        auto err = blade::net::makeTextPacket(
+            blade::net::PacketType::ERROR_TEXT,
+            packetSequence_++,
+            "cv::imencode failed"
+        );
+        Tcpserver_.sendPacket(err);
+        return false;
+    }
+
+    std::string metaJson = buildMetaJson(frame);
+
+    auto metaPacket = blade::net::makeTextPacket(
+        blade::net::PacketType::META_JSON,
+        packetSequence_++,
+        metaJson
+    );
+
+    auto imagePacket = blade::net::makePacket(
+        blade::net::PacketType::IMAGE_JPEG,
+        packetSequence_++,
+        jpg
+    );
+
+    if (!Tcpserver_.sendPacket(metaPacket)) {
+        return false;
+    }
+
+    return Tcpserver_.sendPacket(imagePacket);
+}
+
+std::string InspectionPipeline::buildMetaJson(const FrameData& frame) const {
+    std::ostringstream oss;
+    oss << "{";
+    oss << "\"frame_id\":" << frame.frameId << ",";
+    // oss << "\"timestamp_ms\":" << std::fixed << std::setprecision(3) << frame.timestampMs << ",";
+    oss << "\"width\":" << frame.visualizedImage.cols << ",";
+    oss << "\"height\":" << frame.visualizedImage.rows << ",";
+    oss << "\"detections\":[";
+
+    for (size_t i = 0; i < frame.results.size(); ++i) {
+        const auto& r = frame.results[i];
+        if (i > 0) {
+            oss << ",";
+        }
+
+        oss << "{";
+        oss << "\"class_id\":" << r.classId << ",";
+        oss << "\"class_name\":\"" << escapeJson(r.className) << "\",";
+        oss << "\"confidence\":" << std::fixed << std::setprecision(4) << r.confidence << ",";
+        oss << "\"box\":{"
+            << "\"x\":" << r.box.x << ","
+            << "\"y\":" << r.box.y << ","
+            << "\"w\":" << r.box.width << ","
+            << "\"h\":" << r.box.height << "}";
+        oss << "}";
+    }
+
+    oss << "]}";
+    return oss.str();
+}
+
+std::string InspectionPipeline::escapeJson(const std::string& text) const {
+    std::ostringstream oss;
+
+    for (char ch : text) {
+        switch (ch) {
+        case '"':
+            oss << "\\\"";
+            break;
+        case '\\':
+            oss << "\\\\";
+            break;
+        case '\n':
+            oss << "\\n";
+            break;
+        case '\r':
+            oss << "\\r";
+            break;
+        case '\t':
+            oss << "\\t";
+            break;
+        default:
+            oss << ch;
+            break;
+        }
+    }
+
+    return oss.str();
+}
+
+bool InspectionPipeline::compareCpuCudaPreprocess(
+    const cv::Mat& image,
+    Preprocessor& cpuPreprocessor,
+    CudaPreprocessor& cudaPreprocessor,
+    TensorRTInfer& infer
+) {
+    auto saveBlobAsImage = [](
+        const std::string& savePath,
+        const float* blob,
+        int width,
+        int height
+    ) -> bool {
+        if (!blob) {
+            std::cerr << "[COMPARE] blob is null" << std::endl;
+            return false;
+        }
+
+        cv::Mat out(height, width, CV_8UC3);
+        int area = width * height;
+
+        for (int y = 0; y < height; ++y) {
+            cv::Vec3b* rowPtr = out.ptr<cv::Vec3b>(y);
+
+            for (int x = 0; x < width; ++x) {
+                int idx = y * width + x;
+
+                float r = blob[0 * area + idx];
+                float g = blob[1 * area + idx];
+                float b = blob[2 * area + idx];
+
+                r = std::max(0.0f, std::min(1.0f, r));
+                g = std::max(0.0f, std::min(1.0f, g));
+                b = std::max(0.0f, std::min(1.0f, b));
+
+                rowPtr[x] = cv::Vec3b(
+                    static_cast<uchar>(std::round(b * 255.0f)),
+                    static_cast<uchar>(std::round(g * 255.0f)),
+                    static_cast<uchar>(std::round(r * 255.0f))
+                );
+            }
+        }
+
+        if (!cv::imwrite(savePath, out)) {
+            std::cerr << "[COMPARE] failed to save image: "
+                      << savePath
+                      << std::endl;
+            return false;
+        }
+
+        std::cout << "[COMPARE] saved image: "
+                  << savePath
+                  << std::endl;
+
+        return true;
+    };
+
+    // 1. CPU前处理
+    PreprocessResult cpuPrep = cpuPreprocessor.process(image);
+
+    if (cpuPrep.blob.empty()) {
+        std::cerr << "[COMPARE] cpu preprocess failed" << std::endl;
+        return false;
+    }
+
+    // 2. CUDA前处理
+    PreprocessResult cudaPrep;
+
+    bool ok = cudaPreprocessor.process(
+        image,
+        infer.inputDeviceBuffer(),
+        infer.inputElementSize(),
+        cudaPrep,
+        infer.stream()
+    );
+
+    if (!ok) {
+        std::cerr << "[COMPARE] cuda preprocess failed" << std::endl;
+        return false;
+    }
+
+    // 3. CUDA结果拷回CPU
+    const int inputC = 3;
+    const int inputH = 640;
+    const int inputW = 640;
+    const int count = inputC * inputH * inputW;
+
+    std::vector<float> cudaBlob(count);
+    cudaError_t err = cudaSuccess;
+
+    if (infer.inputElementSize() == sizeof(float)) {
+        err = cudaMemcpyAsync(
+            cudaBlob.data(),
+            infer.inputDeviceBuffer(),
+            count * sizeof(float),
+            cudaMemcpyDeviceToHost,
+            infer.stream()
+        );
+    } else if (infer.inputElementSize() == sizeof(__half)) {
+        // Modified: FP16 input buffer must be copied as half and converted back to float before diff.
+        std::vector<__half> halfBlob(count);
+        err = cudaMemcpyAsync(
+            halfBlob.data(),
+            infer.inputDeviceBuffer(),
+            count * sizeof(__half),
+            cudaMemcpyDeviceToHost,
+            infer.stream()
+        );
+
+        if (err == cudaSuccess) {
+            err = cudaStreamSynchronize(infer.stream());
+            if (err != cudaSuccess) {
+                std::cerr << "[COMPARE] cudaStreamSynchronize failed: "
+                          << cudaGetErrorString(err)
+                          << std::endl;
+                return false;
+            }
+
+            for (int i = 0; i < count; ++i) {
+                cudaBlob[i] = __half2float(halfBlob[i]);
+            }
+        }
+    } else {
+        std::cerr << "[COMPARE] unsupported input element size: "
+                  << infer.inputElementSize()
+                  << std::endl;
+        return false;
+    }
+
+    if (err != cudaSuccess) {
+        std::cerr << "[COMPARE] cudaMemcpyAsync D2H failed: "
+                  << cudaGetErrorString(err)
+                  << std::endl;
+        return false;
+    }
+
+    err = cudaStreamSynchronize(infer.stream());
+
+    if (err != cudaSuccess) {
+        std::cerr << "[COMPARE] cudaStreamSynchronize failed: "
+                  << cudaGetErrorString(err)
+                  << std::endl;
+        return false;
+    }
+
+    // 4. 比较scale/pad
+    std::cout << "[COMPARE] cpu scale=" << cpuPrep.scale
+              << ", pad=(" << cpuPrep.pad_x << "," << cpuPrep.pad_y << ")"
+              << std::endl;
+
+    std::cout << "[COMPARE] cuda scale=" << cudaPrep.scale
+              << ", pad=(" << cudaPrep.pad_x << "," << cudaPrep.pad_y << ")"
+              << std::endl;
+
+    // 5. 比较blob数据
+    const float* cpuData = cpuPrep.blob.ptr<float>();
+
+    double maxDiff = 0.0;
+    double meanDiff = 0.0;
+
+    for (int i = 0; i < count; ++i) {
+        double diff = std::abs(
+            static_cast<double>(cpuData[i]) -
+            static_cast<double>(cudaBlob[i])
+        );
+
+        maxDiff = std::max(maxDiff, diff);
+        meanDiff += diff;
+    }
+
+    meanDiff /= static_cast<double>(count);
+
+    std::cout << "[COMPARE] preprocess diff: "
+              << "maxDiff=" << maxDiff
+              << ", meanDiff=" << meanDiff
+              << std::endl;
+
+    // 6. 保存原图和CUDA前处理结果图像
+    cv::imwrite("test/original_debug.jpg", image);
+
+    saveBlobAsImage(
+        "test/cuda_preprocess_debug.jpg",
+        cudaBlob.data(),
+        inputW,
+        inputH
+    );
+
+    std::cout << "[COMPARE] saved image: original_debug.jpg" << std::endl;
+    std::cout << "[COMPARE] saved image: cuda_preprocess_debug.jpg" << std::endl;
+
+    return true;
+}
+} // namespace blade::pipeline
