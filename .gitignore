@@ -18,6 +18,7 @@ results/
 data/
 datasets/
 models/
+runs/
 
 # Editor and OS files
 .vscode/
