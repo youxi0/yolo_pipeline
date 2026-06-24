@@ -8,6 +8,7 @@
 #include <chrono>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <opencv2/imgcodecs.hpp>
 #include <sstream>
 
@@ -429,7 +430,11 @@ void InspectionPipeline::postprocessLoop() {
     auto& logger = utils::FileLogger::instance();
     YoloSegPostprocessor postprocessor(config_.confThreshold, config_.nmsThreshold, config_.maskThreshold);
     Visualizer visualizer;
-    utils::BaselineSaver baselineSaver(config_.baselineDir);
+    std::unique_ptr<utils::BaselineSaver> baselineSaver;
+    if (config_.saveBaseline) {
+        // BaselineSaver只负责把FP16结果落盘留档；INT8对比线程不依赖这些文件。
+        baselineSaver = std::make_unique<utils::BaselineSaver>(config_.baselineDir);
+    }
     while (running_) {
         FrameData processed;
 
@@ -447,7 +452,7 @@ void InspectionPipeline::postprocessLoop() {
         processed.cost.visualize_ms = timer.elapsedMs();
         processed.cost.total_ms += processed.cost.visualize_ms;
 
-        if (!baselineSaver.save(processed)) {
+        if (baselineSaver && !baselineSaver->save(processed)) {
             logger.warning("[BASELINE] failed to save frameId=" + std::to_string(processed.frameId));
         }
 

@@ -27,6 +27,12 @@ find_library(TENSORRT_NVINFER_LIB
     REQUIRED
 )
 
+find_library(TENSORRT_NVONNXPARSER_LIB
+    NAMES nvonnxparser
+    PATHS ${TENSORRT_DIR}/lib
+    REQUIRED
+)
+
 #将找到文件以“列表（List）”的形式存入BLADE_CORE_SOURCES中
 #CONFIGURE_DEPENDS表示当新增或删除cpp文件时,CMake会自动重新配置
 file(GLOB_RECURSE BLADE_CORE_SOURCES
@@ -38,6 +44,7 @@ file(GLOB_RECURSE BLADE_CORE_SOURCES
 
 list(REMOVE_ITEM BLADE_CORE_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/build_engine.cpp
 )
 
 #模块:根据BUILD_BLADE_SHARED选择生成动态库或静态库
@@ -59,6 +66,7 @@ target_include_directories(blade_core PUBLIC
 target_link_libraries(blade_core PUBLIC
     ${OpenCV_LIBS}
     ${TENSORRT_NVINFER_LIB}
+    ${TENSORRT_NVONNXPARSER_LIB}
     CUDA::cudart
     Threads::Threads
 )
@@ -76,8 +84,20 @@ target_link_libraries(blade_demo PRIVATE
     blade_core
 )
 
+add_executable(blade_build_engine
+    src/tools/build_engine.cpp
+)
+
+target_link_libraries(blade_build_engine PRIVATE
+    blade_core
+)
+
 #设置可执行文件输出目录
 set_target_properties(blade_demo PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+set_target_properties(blade_build_engine PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 

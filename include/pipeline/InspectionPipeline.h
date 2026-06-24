@@ -41,6 +41,7 @@ struct PipelineConfig {
     bool useCudaPreprocess = true;
 
     // 新增配置: FP16 baseline和运行日志的保存目录，便于后续和INT8结果做对比。
+    bool saveBaseline = true;
     std::string baselineDir = "results/baseline_fp16";
     std::string logDir = "results/logs";
 

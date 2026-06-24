@@ -65,6 +65,7 @@ void printUsage(const char* app) {
               << "  --type     folder | video | camera\n"
               << "  --port     TCP listen port, default 9000\n"
               << "  --classes  comma separated class names, default defect\n"
+              << "  --save_baseline  0 | 1, default 1\n"
               << "  --baseline_dir  baseline output dir, default results/baseline_fp16\n"
               << "  --log_dir       log output dir, default results/logs\n"
               << "  --enable_int8_compare  0 | 1, default 0\n"
@@ -94,6 +95,7 @@ int main(int argc, char** argv) {
     std::string sourcePath = getArg(argc, argv, "--source");
     std::string sourceType = getArg(argc, argv, "--type", "folder");
     std::string classText = getArg(argc, argv, "--classes", "defect");
+    bool saveBaseline = getArg(argc, argv, "--save_baseline", "1") == "1";
     std::string baselineDir = getArg(argc, argv, "--baseline_dir", "results/baseline_fp16");
     std::string logDir = getArg(argc, argv, "--log_dir", "results/logs");
     bool enableInt8Compare = getArg(argc, argv, "--enable_int8_compare", "0") == "1";
@@ -139,6 +141,7 @@ int main(int argc, char** argv) {
     config.queueSize = 4;
     config.heartbeatIntervalMs = 2000;
     config.heartbeatTimeoutMs = 8000;
+    config.saveBaseline = saveBaseline;
     config.baselineDir = baselineDir;
     config.logDir = logDir;
     config.enableInt8Compare = enableInt8Compare;
