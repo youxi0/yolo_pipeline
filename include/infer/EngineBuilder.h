@@ -72,7 +72,7 @@ private:
         nvinfer1::IBuilder& builder,
         nvinfer1::INetworkDefinition& network,
         nvinfer1::IBuilderConfig& builderConfig,
-        std::vector<std::unique_ptr<nvinfer1::IOptimizationProfile, TrtDestroy<nvinfer1::IOptimizationProfile>>>& profiles
+        std::vector<nvinfer1::IOptimizationProfile*>& profiles
     );
     bool writeEnginePlan(const nvinfer1::IHostMemory& plan);
 

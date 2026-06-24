@@ -69,7 +69,9 @@ bool EngineBuilder::build() {
 
     builderConfig->setMaxWorkspaceSize(config_.workspaceSizeMiB * 1024ULL * 1024ULL);
 
-    std::vector<std::unique_ptr<nvinfer1::IOptimizationProfile, TrtDestroy<nvinfer1::IOptimizationProfile>>> profiles;
+    // 修改点: IOptimizationProfile析构函数是protected，不能放进unique_ptr里delete。
+    // 这里只保存TensorRT返回的裸指针，实际生命周期由builder/config在构建阶段维护。
+    std::vector<nvinfer1::IOptimizationProfile*> profiles;
     if (!configureOptimizationProfile(*builder, *network, *builderConfig, profiles)) {
         return false;
     }
@@ -227,7 +229,7 @@ bool EngineBuilder::configureOptimizationProfile(
     nvinfer1::IBuilder& builder,
     nvinfer1::INetworkDefinition& network,
     nvinfer1::IBuilderConfig& builderConfig,
-    std::vector<std::unique_ptr<nvinfer1::IOptimizationProfile, TrtDestroy<nvinfer1::IOptimizationProfile>>>& profiles
+    std::vector<nvinfer1::IOptimizationProfile*>& profiles
 ) {
     bool needsProfile = false;
     for (int i = 0; i < network.getNbInputs(); ++i) {
@@ -243,9 +245,8 @@ bool EngineBuilder::configureOptimizationProfile(
         return true;
     }
 
-    std::unique_ptr<nvinfer1::IOptimizationProfile, TrtDestroy<nvinfer1::IOptimizationProfile>> profile(
-        builder.createOptimizationProfile()
-    );
+    // 修改点: createOptimizationProfile()返回的profile不能手动delete，直接交给builder config使用。
+    nvinfer1::IOptimizationProfile* profile = builder.createOptimizationProfile();
     if (!profile) {
         setError("failed to create optimization profile");
         return false;
@@ -298,13 +299,13 @@ bool EngineBuilder::configureOptimizationProfile(
         utils::FileLogger::instance().info(oss.str());
     }
 
-    const int profileIndex = builderConfig.addOptimizationProfile(profile.get());
+    const int profileIndex = builderConfig.addOptimizationProfile(profile);
     if (profileIndex < 0) {
         setError("failed to add optimization profile to builder config");
         return false;
     }
 
-    profiles.push_back(std::move(profile));
+    profiles.push_back(profile);
     return true;
 }
 

@@ -9,8 +9,6 @@
 #include <cstddef>
 #include <memory>
 #include <string>
-#include <type_traits>
-#include <utility>
 #include <vector>
 
 //模块:TensorRT日志类,用于接收TensorRT内部构建和推理日志
@@ -19,34 +17,16 @@ public:
     void log(Severity severity, const char* msg) noexcept override;
 };
 
-namespace detail {
-
-// 修改点: TensorRT不同版本的对象释放接口不完全一致。
-// 旧接口对象通常提供destroy()，但IOptimizationProfile等新接口对象没有destroy()。
-// 这里在编译期检测destroy()是否存在，避免给没有destroy()的类型实例化错误代码。
-template <typename T, typename = void>
-struct HasTensorRTDestroy : std::false_type {};
-
-template <typename T>
-struct HasTensorRTDestroy<T, std::void_t<decltype(std::declval<T*>()->destroy())>> : std::true_type {};
-
-} // namespace detail
-
-//模块:TensorRT对象释放器,用于自动释放runtime、engine、context以及builder阶段对象
+//模块:TensorRT对象释放器,用于自动释放runtime、engine、context以及支持destroy()的builder阶段对象
+// 修改点: 这个释放器只用于明确提供destroy()的TensorRT接口；IOptimizationProfile这类对象不能delete。
 template <typename T>
 class TrtDestroy{
 public:
     void operator()(T* obj) const
     {
-        if (!obj) {
-            return;
-        }
-
-        // 修改点: 有destroy()的TensorRT对象继续调用destroy()；没有destroy()的对象使用delete释放。
-        if constexpr (detail::HasTensorRTDestroy<T>::value) {
+        if (obj)
+        {
             obj->destroy();
-        } else {
-            delete obj;
         }
     }
 };
