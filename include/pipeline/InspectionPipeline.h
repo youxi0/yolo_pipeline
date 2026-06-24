@@ -43,6 +43,14 @@ struct PipelineConfig {
     // 新增配置: FP16 baseline和运行日志的保存目录，便于后续和INT8结果做对比。
     std::string baselineDir = "results/baseline_fp16";
     std::string logDir = "results/logs";
+
+    // INT8对比开关：开启后额外启动一个线程，用INT8 engine重跑同一帧并和FP16 baseline做对比。
+    bool enableInt8Compare = false;
+    std::string int8EnginePath;
+    std::string compareDir = "results/compare_fp16_int8";
+    float compareIouThreshold = 0.5f;
+    float compareMinMatchRate = 0.95f;
+    float compareMaxMeanScoreDiff = 0.10f;
 };
 
 //模块:端侧检测服务主类
@@ -54,6 +62,7 @@ public:
 
     bool start();
     void stop();
+    bool isRunning() const;
 
 private:
     void networkAcceptLoop();
@@ -66,6 +75,7 @@ private:
     void preprocessLoop();
     void inferLoop();
     void postprocessLoop();
+    void int8CompareLoop();
     
     void sendLoop();
 
@@ -91,6 +101,7 @@ private:
     BlockingQueue<FrameData> rawQueue_;
     BlockingQueue<FrameData> preprocessQueue_;
     BlockingQueue<FrameData> inferQueue_;
+    BlockingQueue<FrameData> int8CompareQueue_;
 
 
     std::atomic<bool> running_{false};
@@ -116,6 +127,7 @@ private:
     std::thread inferThread_;
 
     std::thread postprocessThread_;
+    std::thread int8CompareThread_;
 
     //5.sendLoop:把可视化图像和检测信息通过TCP发送给Qt
     std::thread sendThread_;

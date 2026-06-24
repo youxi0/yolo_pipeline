@@ -1,6 +1,7 @@
 #include "pipeline/InspectionPipeline.h"
 #include "common/ScopeTimer.h"
 #include "utils/FileLogger.h"
+#include "utils/Int8CompareSaver.h"
 
 #include <cuda_fp16.h>
 
@@ -21,6 +22,7 @@ InspectionPipeline::InspectionPipeline(std::unique_ptr<ImageSource> source, cons
       rawQueue_(static_cast<size_t>(config.queueSize)),
       preprocessQueue_(static_cast<size_t>(config.queueSize)),
       inferQueue_(static_cast<size_t>(config.queueSize)),
+      int8CompareQueue_(static_cast<size_t>(config.queueSize)),
       sendQueue_(static_cast<size_t>(config.queueSize)) {}
 
 InspectionPipeline::~InspectionPipeline() {
@@ -39,6 +41,16 @@ bool InspectionPipeline::start() {
     }
     logger.info("inspection pipeline starting");
     logger.info("engine path: " + config_.enginePath);
+
+    // INT8对比线程是可选旁路；没有INT8 engine时自动关闭，避免影响FP16 baseline主流程。
+    if (config_.enableInt8Compare) {
+        if (config_.int8EnginePath.empty()) {
+            logger.warning("[INT8 Compare] enabled but int8 engine path is empty");
+            config_.enableInt8Compare = false;
+        } else {
+            logger.info("[INT8 Compare] engine path: " + config_.int8EnginePath);
+        }
+    }
 
     if (!source_) {
         std::cerr << "Image source is null." << std::endl;
@@ -77,6 +89,9 @@ bool InspectionPipeline::start() {
     }
 
     postprocessThread_ = std::thread(&InspectionPipeline::postprocessLoop, this);
+    if (config_.enableInt8Compare) {
+        int8CompareThread_ = std::thread(&InspectionPipeline::int8CompareLoop, this);
+    }
     sendThread_ = std::thread(&InspectionPipeline::sendLoop, this);
 
     logger.info("inspection pipeline started");
@@ -84,10 +99,8 @@ bool InspectionPipeline::start() {
 }
 
 void InspectionPipeline::stop() {
-    if (!running_) {
-        return;
-    }
-
+    // 即使running_已经被工作线程置为false，也要继续唤醒队列并join线程。
+    // 否则离线folder跑完后，析构函数再次调用stop()时可能留下joinable线程。
     running_ = false;
 
     paused_ = true;
@@ -96,6 +109,7 @@ void InspectionPipeline::stop() {
     rawQueue_.stop();
     preprocessQueue_.stop();
     inferQueue_.stop();
+    int8CompareQueue_.stop();
     sendQueue_.stop();
 
     Tcpserver_.stop();
@@ -132,9 +146,16 @@ void InspectionPipeline::stop() {
     if (postprocessThread_.joinable()) {
         postprocessThread_.join();
     }
+    if (int8CompareThread_.joinable()) {
+        int8CompareThread_.join();
+    }
 
     utils::FileLogger::instance().info("inspection pipeline stopped");
     utils::FileLogger::instance().close();
+}
+
+bool InspectionPipeline::isRunning() const {
+    return running_.load();
 }
 
 void InspectionPipeline::networkAcceptLoop() {
@@ -301,6 +322,7 @@ void InspectionPipeline::gpuInferLoop() {
 
     std::cout << "[GPU] gpuInferLoop exit" << std::endl;
     logger.info("[GPU] gpuInferLoop exit");
+    inferQueue_.stop();
 }
 
 void InspectionPipeline::captureLoop() {
@@ -322,13 +344,8 @@ void InspectionPipeline::captureLoop() {
             std::cerr << "[CAPTURE] source finished or read failed" << std::endl;
             logger.warning("[CAPTURE] source finished or read failed");
 
-            // processingEnabled_.store(false);
-            running_ = false;
-
-            if(source_) source_->reset();
-            
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            continue;
+            rawQueue_.stop();
+            break;
         }
         if (!rawQueue_.push(std::move(raw))) {
             break;
@@ -367,6 +384,7 @@ void InspectionPipeline::preprocessLoop() {
 
     std::cout << "[PREPROCESS] exit" << std::endl;
     logger.info("[PREPROCESS] exit");
+    preprocessQueue_.stop();
 }
 
 void InspectionPipeline::inferLoop() {
@@ -404,6 +422,7 @@ void InspectionPipeline::inferLoop() {
 
     std::cout << "[INFER] exit" << std::endl;
     logger.info("[INFER] exit");
+    inferQueue_.stop();
 }
 
 void InspectionPipeline::postprocessLoop() {
@@ -432,6 +451,14 @@ void InspectionPipeline::postprocessLoop() {
             logger.warning("[BASELINE] failed to save frameId=" + std::to_string(processed.frameId));
         }
 
+        // INT8对比线程消费的是FP16后处理后的完整帧副本：
+        // 这里保留FP16检测结果、耗时和原图，便于INT8线程用同一张图重新推理并逐帧比较。
+        if (config_.enableInt8Compare) {
+            if (!int8CompareQueue_.push(processed)) {
+                logger.warning("[INT8 Compare] failed to enqueue frameId=" + std::to_string(processed.frameId));
+            }
+        }
+
         std::ostringstream costLog;
         costLog << "[TIME] frameId=" << processed.frameId
                 << ", preprocess=" << processed.cost.preprocess_ms << " ms"
@@ -458,6 +485,106 @@ void InspectionPipeline::postprocessLoop() {
 
     std::cout << "[POSTPROCESS] exit" << std::endl;
     logger.info("[POSTPROCESS] exit");
+    int8CompareQueue_.stop();
+    sendQueue_.stop();
+    running_ = false;
+    Tcpserver_.stop();
+}
+
+void InspectionPipeline::int8CompareLoop() {
+    auto& logger = utils::FileLogger::instance();
+
+    TensorRTInfer int8Infer(config_.int8EnginePath);
+    if (!int8Infer.load()) {
+        logger.error("[INT8 Compare] failed to load TensorRT INT8 engine");
+        int8CompareQueue_.stop();
+        return;
+    }
+
+    logger.info("[INT8 Compare] TensorRT INT8 engine loaded");
+
+    CudaPreprocessor cudaPreprocessor(config_.inputWidth, config_.inputHeight);
+    Preprocessor cpuPreprocessor(config_.inputWidth, config_.inputHeight);
+    YoloSegPostprocessor postprocessor(config_.confThreshold, config_.nmsThreshold, config_.maskThreshold);
+
+    utils::Int8CompareConfig compareConfig;
+    compareConfig.saveDir = config_.compareDir;
+    compareConfig.iouThreshold = config_.compareIouThreshold;
+    compareConfig.minMatchRate = config_.compareMinMatchRate;
+    compareConfig.maxMeanScoreDiff = config_.compareMaxMeanScoreDiff;
+    utils::Int8CompareSaver compareSaver(compareConfig);
+
+    while (true) {
+        FrameData fp16Frame;
+        if (!int8CompareQueue_.pop(fp16Frame)) {
+            break;
+        }
+
+        FrameData int8Frame;
+        int8Frame.frameId = fp16Frame.frameId;
+        int8Frame.source_path = fp16Frame.source_path;
+        int8Frame.originalImage = fp16Frame.originalImage;
+
+        ScopeTimer timer;
+
+        // 第一步：预处理。主流程使用CUDA预处理时，INT8对比线程也走同一条CUDA路径。
+        if (config_.useCudaPreprocess) {
+            bool ok = cudaPreprocessor.process(
+                int8Frame.originalImage,
+                int8Infer.inputDeviceBuffer(),
+                int8Infer.inputElementSize(),
+                int8Frame.prep,
+                int8Infer.stream()
+            );
+
+            int8Frame.cost.preprocess_ms = timer.elapsedMs();
+            int8Frame.cost.total_ms += int8Frame.cost.preprocess_ms;
+
+            if (!ok) {
+                logger.error("[INT8 Compare] cuda preprocess failed, frameId=" + std::to_string(fp16Frame.frameId));
+                continue;
+            }
+
+            // 第二步：推理。输入已经写到TensorRT input buffer，直接enqueue。
+            timer.reset();
+            int8Frame.outputs = int8Infer.forwardFromDevice();
+        } else {
+            int8Frame.prep = cpuPreprocessor.process(int8Frame.originalImage);
+            int8Frame.cost.preprocess_ms = timer.elapsedMs();
+            int8Frame.cost.total_ms += int8Frame.cost.preprocess_ms;
+
+            if (int8Frame.prep.blob.empty()) {
+                logger.error("[INT8 Compare] cpu preprocess failed, frameId=" + std::to_string(fp16Frame.frameId));
+                continue;
+            }
+
+            // 第二步：推理。CPU预处理路径由forward()完成H2D、TensorRT、D2H。
+            timer.reset();
+            int8Frame.outputs = int8Infer.forward(int8Frame.prep.blob);
+        }
+
+        int8Frame.cost.infer_ms = timer.elapsedMs();
+        int8Frame.cost.total_ms += int8Frame.cost.infer_ms;
+
+        if (int8Frame.outputs.empty()) {
+            logger.error("[INT8 Compare] TensorRT output empty, frameId=" + std::to_string(fp16Frame.frameId));
+            continue;
+        }
+
+        // 第三步：后处理。阈值和类别名与FP16 baseline完全一致，只比较engine差异。
+        timer.reset();
+        int8Frame.results = postprocessor.process(int8Frame.outputs, int8Frame.prep, config_.classNames);
+        int8Frame.cost.postprocess_ms = timer.elapsedMs();
+        int8Frame.cost.total_ms += int8Frame.cost.postprocess_ms;
+
+        // 第四步：保存逐帧对比指标和最终summary。
+        if (!compareSaver.save(fp16Frame, int8Frame)) {
+            logger.warning("[INT8 Compare] failed to save frameId=" + std::to_string(fp16Frame.frameId));
+        }
+    }
+
+    std::cout << "[INT8 Compare] exit" << std::endl;
+    logger.info("[INT8 Compare] exit");
 }
 
 void InspectionPipeline::sendLoop() {

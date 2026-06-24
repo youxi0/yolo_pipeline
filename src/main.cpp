@@ -66,7 +66,13 @@ void printUsage(const char* app) {
               << "  --port     TCP listen port, default 9000\n"
               << "  --classes  comma separated class names, default defect\n"
               << "  --baseline_dir  baseline output dir, default results/baseline_fp16\n"
-              << "  --log_dir       log output dir, default results/logs\n";
+              << "  --log_dir       log output dir, default results/logs\n"
+              << "  --enable_int8_compare  0 | 1, default 0\n"
+              << "  --int8_engine          INT8 TensorRT engine path\n"
+              << "  --compare_dir          FP16 vs INT8 output dir, default results/compare_fp16_int8\n"
+              << "  --compare_iou          box IoU threshold, default 0.5\n"
+              << "  --compare_min_match    minimum match rate, default 0.95\n"
+              << "  --compare_max_score_diff  maximum mean score diff, default 0.10\n";
 }
 
 std::string getArg(int argc, char** argv, const std::string& key, const std::string& defaultValue = "") {
@@ -90,6 +96,12 @@ int main(int argc, char** argv) {
     std::string classText = getArg(argc, argv, "--classes", "defect");
     std::string baselineDir = getArg(argc, argv, "--baseline_dir", "results/baseline_fp16");
     std::string logDir = getArg(argc, argv, "--log_dir", "results/logs");
+    bool enableInt8Compare = getArg(argc, argv, "--enable_int8_compare", "0") == "1";
+    std::string int8EnginePath = getArg(argc, argv, "--int8_engine");
+    std::string compareDir = getArg(argc, argv, "--compare_dir", "results/compare_fp16_int8");
+    float compareIouThreshold = std::stof(getArg(argc, argv, "--compare_iou", "0.5"));
+    float compareMinMatchRate = std::stof(getArg(argc, argv, "--compare_min_match", "0.95"));
+    float compareMaxMeanScoreDiff = std::stof(getArg(argc, argv, "--compare_max_score_diff", "0.10"));
     uint16_t port = static_cast<uint16_t>(std::stoi(getArg(argc, argv, "--port", "9000")));
 
     if (enginePath.empty() || sourcePath.empty()) {
@@ -129,6 +141,12 @@ int main(int argc, char** argv) {
     config.heartbeatTimeoutMs = 8000;
     config.baselineDir = baselineDir;
     config.logDir = logDir;
+    config.enableInt8Compare = enableInt8Compare;
+    config.int8EnginePath = int8EnginePath;
+    config.compareDir = compareDir;
+    config.compareIouThreshold = compareIouThreshold;
+    config.compareMinMatchRate = compareMinMatchRate;
+    config.compareMaxMeanScoreDiff = compareMaxMeanScoreDiff;
 
     blade::pipeline::InspectionPipeline pipeline(std::move(source), config);
 
@@ -139,7 +157,7 @@ int main(int argc, char** argv) {
 
     std::cout << "Inspection pipeline is running. Press Ctrl+C to exit." << std::endl;
 
-    while (gRunning) {
+    while (gRunning && pipeline.isRunning()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
